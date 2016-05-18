@@ -1,0 +1,225 @@
+---
+title: "Leg forecasting"
+author: "Z"
+date: "16 May 2016"
+output: pdf_document
+---
+
+```{r echo=TRUE, message=FALSE, warning=FALSE,tidy=TRUE,tidy.opts=list(width.cutoff=60)}
+setwd("/Users/code/")
+require(ggplot2)
+require(dplyr)
+require(gbm)
+library(lubridate)
+library(forecast)
+library(xts)
+library(dummies)
+library(parallel)
+library(foreach)
+library(doSNOW)
+#require(knitr)
+#opts_chunk$set(tidy.opts=list(width.cutoff=60))
+```
+
+
+## Data loading and Preprocessing
+
+```{r echo=TRUE, message=FALSE, warning=FALSE,tidy=TRUE,tidy.opts=list(width.cutoff=60)}
+fitdm <- read.csv("Data/fltdm.csv",header = TRUE)
+
+flt1 <- fitdm %>% filter(FLT_MASTER_FLT_KEY==1)#0.03477632
+flt1 <- fitdm %>% filter(FLT_MASTER_FLT_KEY==2)#0.03110349
+flt1 <- fitdm %>% filter(FLT_MASTER_FLT_KEY==5)#0.02190649
+flt1 <- fitdm %>% filter(FLT_MASTER_FLT_KEY==6)#0.02586229
+
+ggplot(flt1,aes(x=DCP23))+geom_density()
+ggplot(flt1,aes(x=DCP1))+geom_density()
+
+#Check the missing value for each column
+colSums(is.na(flt1))
+
+flt1df <- flt1 %>% dplyr::select(DCP1:DCP16,DCP23)
+flt1df <- tbl_df(flt1df)
+
+featureGen <- function(flt1df){
+#Missing value impute
+colnames(flt1df)[ncol(flt1df)] <- 'booked'
+colna <- colnames(flt1df[is.na(apply(flt1df,2,sum))])
+flt1df[,colna] <- sapply(colna, function(x) flt1df[,x] <- na.approx(flt1df[,x]))
+
+#New features generate
+fltdays <- seq(as.Date("2009-01-01"),by=1,length.out=nrow(flt1df))
+flt1df$date <- fltdays
+flt1df$wday <- wday(flt1df$date)
+flt1df$month <- lubridate::month(flt1df$date)
+flt1df$monthday <- lubridate::mday(flt1df$date)
+flt1df$bookedlag7 <- dplyr::lag(flt1df$booked,7)
+flt1df$bookedlag14 <- dplyr::lag(flt1df$booked,14)
+flt1df$bookedlag21 <- dplyr::lag(flt1df$booked,21)
+flt1df$bookedlag28 <- dplyr::lag(flt1df$booked,28)
+flt1df$wday <- as.factor(flt1df$wday)
+flt1df$month <- as.factor(flt1df$month)
+flt1df$monthday <- as.factor(flt1df$monthday)
+flt1df$year <- year(flt1df$date)
+flt1df2 <- flt1df %>% group_by(year,month) %>% mutate(month_len=n(),wdayindex=rep(1:5,each=7)[1:month_len])
+
+flt1df2$D16_D23Now <- flt1df2$DCP16/flt1df2$bookedlag7
+flt1df2$D16_D9 <- flt1df2$DCP16/flt1df2$DCP9
+D9_D16_sd <- apply(flt1df2[,c("DCP9","DCP10","DCP11","DCP12","DCP13","DCP14","DCP15","DCP16")],1,sd)
+flt1df2$D16_D9_mom <- flt1df2$D16_D9/D9_D16_sd
+
+nrow(flt1df2)
+weekind <- rep(1:round(nrow(flt1df2)/7),each=7)#to generate week index for each day
+flt1df2$weekind <- weekind[1:nrow(flt1df2)]
+
+#simple one step linear regression
+cl <- makeCluster(4)
+clusterExport(cl,c("flt1df2"))
+registerDoSNOW(cl)
+lm_models <- foreach(i=2:floor(nrow(flt1df2)/7),.combine = 'c') %dopar%{#start from 2 instead of 1 is due to bookedlag7 is NA for 1.
+  list(Model=lm(booked~DCP16+bookedlag7, data=flt1df2[which(flt1df2$weekind==i),]))
+  }
+
+#prediction based on lm
+clusterExport(cl,"lm_models")
+book_pred <- foreach(i=1:(round(nrow(flt1df2)/7)-2),.combine = 'c') %dopar%{
+  list(list(booked_lm_pred = round(predict(lm_models[[i]],newdata=flt1df2[which(flt1df2$weekind==(i+2)),]))))
+}
+
+#Add the prediction to the original data
+tmp <- lapply(book_pred,"[[","booked_lm_pred")
+book_pred <- unlist(tmp)
+book_pred <- c(rep(NA,14),book_pred)
+#head(book_pred,20)
+flt1df2$booked_1week_pred <- book_pred
+
+#Add prediction deviation to the original data
+pred_resid <- lapply(lm_models,residuals)
+pred_resid_vec <- unlist(pred_resid)
+pred_resid_vec <- c(rep(NA,14),pred_resid_vec)[1:nrow(flt1df2)]
+flt1df2$deviation <- pred_resid_vec
+
+stopCluster(cl)
+
+
+#One hot encoding
+wdaydummy <- dummy(flt1df2$wday)
+wdaydummy <- wdaydummy[,-c(1)]
+monthdummy <- dummy(flt1df2$month)
+head(monthdummy)
+monthdummy <- monthdummy[,-c(1)]
+flt1df2 <- cbind(flt1df2,wdaydummy)
+flt1df2 <- cbind(flt1df2,monthdummy)
+flt1df2_book_ts <- zooreg(flt1df2$booked,start=as.Date("2009-01-01"))
+return(flt1df2)
+}
+
+#create train and test data
+#splitday <- as.Date(tail(fltdays,1))-60
+
+#train <- flt1df2 %>% filter(date<=splitday)
+#test <- flt1df2 %>% filter(date>splitday)#Last 60 days as testing data.
+```
+
+```{r}
+
+gbmmodel <- function(flt1df2, start=2493){
+  require(gbm)
+  data <- flt1df2[1:start,]
+  data <- data[complete.cases(data),]
+  set.seed(2015)
+  fitgbm <- gbm(booked~DCP16+DCP1+bookedlag7+bookedlag14+bookedlag21+
+  bookedlag28+wday2+wday3+wday4+wday5+wday6+wday7+month2+month3+month4+month5+month6+month7+month8+month9+month10+month11+month12+wdayindex+D16_D23Now+D16_D9+D16_D9_mom+booked_1week_pred+deviation,data=data,distribution = 'gaussian',n.trees = 1000,interaction.depth=2, shrinkage = 0.01)
+  return(fitgbm)
+}
+
+gbmpred <- function(flt1df2,start=2493,fitgbm){
+   pred <- predict(fitgbm,newdata=flt1df2[(start+1):nrow(flt1df2),],n.trees=1000,type="response")
+   actual_pred <- data.frame(actual=flt1df2$booked[(start+1):nrow(flt1df2)],pred=round(pred))
+   relerr <- with(actual_pred,mean(abs(actual-pred)/actual))
+   results <- list(relerr,actual_pred)
+   return(results)
+}
+
+start <- 2493
+gbmtest <- function(start){
+  data <- flt1df2[1:start,]
+  data <- data[complete.cases(data),]
+#  fitgbm <- gbm(booked~DCP16+DCP1+wday+month+monthday+bookedlag7+bookedlag14+bookedlag21+
+#  bookedlag28,data=data,distribution = 'gaussian',n.trees = 500, shrinkage = 0.01)
+#  pred <- predict(fitgbm,newdata=flt1df[(start+1):(start+7),],n.trees=500,type="response")
+  
+#  fitgbm <- gbm(booked~DCP16+DCP1+monthday+year+bookedlag7+bookedlag14+bookedlag21+
+#  bookedlag28+wday+month+wdayindex+D16_D23Now+D16_D9+D16_D9_mom+booked_1week_pred+deviation,data=data,distribution = 'gaussian',n.trees = 1000,interaction.depth=2, shrinkage = 0.01)
+  
+  set.seed(2015)
+  fitgbm <- gbm(booked~DCP16+DCP1+bookedlag7+bookedlag14+bookedlag21+
+  bookedlag28+wday2+wday3+wday4+wday5+wday6+wday7+month2+month3+month4+month5+month6+month7+month8+month9+month10+month11+month12+wdayindex+D16_D23Now+D16_D9+D16_D9_mom+booked_1week_pred+deviation,data=data,distribution = 'gaussian',n.trees = 1000,interaction.depth=2, shrinkage = 0.01)#copy h2o gbm features
+  pred <- predict(fitgbm,newdata=flt1df2[(start+1):nrow(flt1df2),],n.trees=1000,type="response")
+  mean(abs(flt1df2$booked[(start+1):nrow(flt1df2)]-round(pred))/flt1df2$booked[(start+1):nrow(flt1df2)])
+  
+  pred <- predict(fitgbm,newdata=flt1df2[(start+1):(start+7),],n.trees=1000,type="response")
+  resid <- flt1df$booked[(start+1):(start+7)] - round(pred)
+  residrel <- resid/flt1df$booked[(start+1):(start+7)]
+  return(c(sqrt(mean(resid^2)),sqrt(mean(residrel^2))))
+}
+
+```
+
+
+```{r}
+flth <- read.csv("data/flth.csv",header = TRUE)
+head(flth)
+flth <- tbl_df(flth)
+#generate the unique key which is combination of FLT_NO,ORGN,DSTN and only look economic class with LSS
+flth <- flth %>% mutate(FLT_key=paste(FLT_NO,ORGN,DSTN,sep='-')) %>% 
+  arrange(FLT_key,DEP_DATE) %>% filter(CLS_MASTER_COMP=="Y" & REC_TYPE=="LSS")
+
+flth$DEP_DATE <- as.Date(as.character(flth$DEP_DATE))
+flth <- flth %>% filter(DEP_DATE<as.Date("2016-01-01"))#filter the days after 2016-01-01
+flth$SEG_DEP_DATE <- as.Date(as.character(flth$SEG_DEP_DATE))
+#colnames(flth)[(colnames(flth)=="booked")] <- "DCP23"#rename the target variable names.
+flt_key <- (unique(flth$FLT_key))
+flth <- flth[,2:ncol(flth)]
+#Missing data pattern as follows:
+md.pattern(flth)
+
+#fitting the missing value
+colna <- c(grep("DCP",colnames(flth)),grep("booked",colnames(flth)))#why not consider row-wised???
+flth[,colna] <- sapply(colna, function(x) flth[,x] <- na.approx(flth[,x]))
+
+flt_number <- flth %>% group_by(FLT_key) %>% dplyr::summarise(n=n())
+print(flt_number)
+val_flt <- flt_number$FLT_key[flt_number$n==2554]
+
+flth <- flth[which(flth$FLT_key %in% val_flt),]
+table(flth$FLT_key)
+#413-SYD-DXB 0.02281601
+
+
+flt1 <- flth[which(flth$FLT_key=="413-SYD-DXB"),]#0.0237016
+flt1 <- flth[which(flth$FLT_key=="47-DXB-FRA"),]#0.04534938
+flt1 <- flth[which(flth$FLT_key=="859-DXB-KWI"),]#0.1197357
+flt1 <- flth[which(flth$FLT_key=="4-LHR-DXB"),]#0.02552567
+flt1 <- flth[which(flth$FLT_key=="3-DXB-LHR"),]#0.02545359
+flt1 <- flth[which(flth$FLT_key=="2-LHR-DXB"),]#0.03096213
+flt1 <- flth[which(flth$FLT_key=="1-DXB-LHR"),]#0.03445925
+
+flt1df <- flt1 %>% dplyr::select(DCP1:DCP16,DCP23)
+flt1df <- tbl_df(flt1df)
+flt1df2 <- featureGen(flt1df)
+
+
+
+#testindex <- 2493:2547
+
+ggplot(flt1df2,aes(x=date,y=booked,color=as.factor(wday)))+geom_line()+facet_grid(month~wday)+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+gm2 <- gbmmodel(flt1df2)
+gp <- gbmpred(flt1df2,start=2493,gm2)
+gp[[1]]
+
+
+```
+
